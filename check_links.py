@@ -1,10 +1,10 @@
 import requests
-import csv
+import pandas as pd
+import streamlit as st
+import time
+from io import StringIO
 
-def read_links_from_file(filename):
-    with open(filename, "r") as file:
-        return [line.strip() for line in file if line.strip()]
-
+# --- Utility Functions ---
 def check_link_status(url):
     try:
         session = requests.Session()
@@ -19,58 +19,71 @@ def is_soft_404(content):
     content_lower = content.lower()
     return any(phrase in content_lower for phrase in soft_404_phrases)
 
-def main():
-    input_file = "links.txt"
-    output_csv = "link_report.csv"
-    links = read_links_from_file(input_file)
+# --- Streamlit App ---
+st.title("🔗 Soft 404 URL Checker")
+st.markdown("Upload a `.txt` or `.csv` file with one URL per line or column.")
 
-    print(f"🔍 Checking {len(links)} links...\n")
+uploaded_file = st.file_uploader("Upload file", type=["txt", "csv"])
 
-    # Prepare CSV file
-    with open(output_csv, "w", newline="", encoding="utf-8") as csvfile:
-        fieldnames = ["Original Link", "Status", "Final URL", "Redirect Path", "Notes"]
-        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-        writer.writeheader()
+rate_limit = st.slider("Delay between requests (seconds)", min_value=0.0, max_value=5.0, value=1.0, step=0.1)
 
-        for link in links:
-            status, path, content_or_error = check_link_status(link)
+if uploaded_file is not None:
+    # Parse file
+    if uploaded_file.name.endswith(".txt"):
+        content = uploaded_file.read().decode("utf-8")
+        links = [line.strip() for line in content.splitlines() if line.strip()]
+    elif uploaded_file.name.endswith(".csv"):
+        df_input = pd.read_csv(uploaded_file)
+        links = df_input.iloc[:, 0].dropna().astype(str).tolist()
 
-            if status is None:
-                print(f"[🚫 EXCEPTION] {link} → {content_or_error}")
-                writer.writerow({
-                    "Original Link": link,
-                    "Status": "ERROR",
-                    "Final URL": "",
-                    "Redirect Path": " > ".join(path),
-                    "Notes": content_or_error
-                })
-                continue
+    st.info(f"✅ {len(links)} links loaded. Checking...")
 
+    # Set up progress UI
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+
+    results = []
+
+    for i, link in enumerate(links, start=1):
+        status, path, content_or_error = check_link_status(link)
+        time.sleep(rate_limit)  # ⏱️ Rate limiting
+
+        if status is None:
+            notes = content_or_error
+            final_url = ""
+            full_path = " > ".join(path)
+            status_display = "ERROR"
+        else:
             final_url = path[-1]
             full_path = " > ".join(path)
 
             if 300 <= status < 400:
-                print(f"[↪️ REDIRECT {status}] {link} → {final_url}")
                 notes = f"Redirect {status}"
             elif status == 200 and is_soft_404(content_or_error):
-                print(f"[❌ SOFT 404] {link} → {final_url}")
                 notes = "Soft 404 detected in page content"
             elif status == 200:
-                print(f"[✅ OK] {link} → {final_url}")
                 notes = "OK"
             else:
-                print(f"[❌ ERROR {status}] {link} → {final_url}")
                 notes = f"Error status {status}"
 
-            writer.writerow({
-                "Original Link": link,
-                "Status": status,
-                "Final URL": final_url,
-                "Redirect Path": full_path,
-                "Notes": notes
-            })
+            status_display = status
 
-    print(f"\n✅ Finished! Results saved to: {output_csv}")
+        results.append({
+            "Original Link": link,
+            "Status": status_display,
+            "Final URL": final_url,
+            "Redirect Path": full_path,
+            "Notes": notes
+        })
 
-if __name__ == "__main__":
-    main()
+        # Update progress
+        progress = i / len(links)
+        progress_bar.progress(progress)
+        status_text.text(f"Checked {i} of {len(links)} links")
+
+    st.success("✅ Done checking all links.")
+    df = pd.DataFrame(results)
+    st.dataframe(df)
+
+    csv = df.to_csv(index=False).encode("utf-8")
+    st.download_button("📥 Download Results as CSV", csv, "link_report.csv", "text/csv")
