@@ -27,11 +27,12 @@ def is_soft_404(content):
         "we're sorry, the page", "not available", "content has been removed"
     ]
     content_lower = content.lower()
-    return any(phrase in content_lower for phrase in content_lower.splitlines()[:20] for phrase in soft_404_phrases)
+    return any(phrase in content_lower for phrase in soft_404_phrases)
 
 # --- Streamlit App ---
-st.title("🔗 Soft 404 URL Checker")
-st.markdown("Upload a `.txt` or `.csv` file containing a list of URLs.")
+st.set_page_config(page_title="Soft 404 Checker Dashboard", layout="wide")
+st.title("🔗 Soft 404 URL Checker with Dashboard")
+st.markdown("Upload a `.txt` or `.csv` file with a list of URLs to check for redirects, soft 404s, and other errors.")
 
 uploaded_file = st.file_uploader("Upload file", type=["txt", "csv"])
 rate_limit = st.slider("Delay between requests (seconds)", min_value=0.0, max_value=5.0, value=1.0, step=0.1)
@@ -98,5 +99,46 @@ if uploaded_file is not None:
         df_results = pd.DataFrame(results)
         st.dataframe(df_results)
 
-        csv = df_results.to_csv(index=False).encode("utf-8")
-        st.download_button("📥 Download Results as CSV", csv, "link_report.csv", "application/octet-stream")
+        # --- Error Dashboard ---
+        st.subheader("📊 Error Dashboard")
+
+        # Categorize
+        df_errors = df_results[df_results["Status"] == "ERROR"]
+        df_soft_404 = df_results[df_results["Notes"].str.contains("Soft 404", case=False, na=False)]
+        df_redirects = df_results[df_results["Status"].astype(str).str.startswith("3")]
+
+        # Metrics
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Total Links", len(df_results))
+        col2.metric("Errors", len(df_errors))
+        col3.metric("Soft 404s", len(df_soft_404))
+        col4.metric("Redirects", len(df_redirects))
+
+        # Status Code Distribution Chart
+        st.subheader("📈 HTTP Status Code Breakdown")
+        status_counts = df_results["Status"].value_counts().sort_index()
+        st.bar_chart(status_counts)
+
+        # --- Filtered View ---
+        st.subheader("🔍 Filter Results")
+
+        filter_option = st.radio("Show:", ["All", "Errors Only", "Soft 404s Only", "Redirects Only"])
+
+        if filter_option == "All":
+            filtered_df = df_results
+        elif filter_option == "Errors Only":
+            filtered_df = df_errors
+        elif filter_option == "Soft 404s Only":
+            filtered_df = df_soft_404
+        else:
+            filtered_df = df_redirects
+
+        st.dataframe(filtered_df)
+
+        # --- Download Buttons ---
+        st.subheader("📥 Download Reports")
+        csv_all = df_results.to_csv(index=False).encode("utf-8")
+        csv_filtered = filtered_df.to_csv(index=False).encode("utf-8")
+
+        st.download_button("Download All Results", csv_all, "all_link_results.csv", "application/octet-stream")
+        st.download_button("Download Filtered Results", csv_filtered, "filtered_link_results.csv", "application/octet-stream")
