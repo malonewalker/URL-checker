@@ -39,7 +39,13 @@ def check_redirects(url):
         response = requests.get(url, allow_redirects=True, timeout=10)
         history_urls = [resp.url for resp in response.history]
         final_url = response.url
-        full_chain = [url] + history_urls + ([final_url] if final_url != history_urls[-1] if history_urls else True else [])
+
+        if history_urls:
+            full_chain = [url] + history_urls
+            if final_url != history_urls[-1]:
+                full_chain.append(final_url)
+        else:
+            full_chain = [url, final_url]
 
         original_netloc = urlparse(url).netloc
         final_netloc = urlparse(final_url).netloc
