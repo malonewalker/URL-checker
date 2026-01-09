@@ -2,8 +2,12 @@ import streamlit as st
 import pandas as pd
 import time
 import re
-import requests
+import httpx
+import asyncio
 from urllib.parse import urlparse
+from datetime import datetime, timedelta
+import hashlib
+import json
 
 # --- AUTHENTICATION ---
 st.title("🔍 URL Redirect Checker with Authentication")
@@ -16,9 +20,8 @@ if password != "BPRFSR":
 if "run_check" not in st.session_state:
     st.session_state.run_check = False
 
-# --- FILE UPLOAD AND TOGGLE ---
+# --- FILE UPLOAD ---
 uploaded_file = st.file_uploader("Upload a file with URLs (.txt, .csv, .xlsx)", type=["txt", "csv", "xlsx"])
-delay_toggle = st.toggle("Add 1 second delay between URL checks")
 
 # --- URL HELPERS ---
 URL_REGEX = re.compile(r"""(?i)\b((?:https?://|www\.)[^\s<>"]+|(?:https?://|www\.)\S+)""")
@@ -90,39 +93,103 @@ def build_long_url_df(df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame(columns=list(df.columns) + ["Source Column", "URL"])
     return pd.DataFrame(rows)
 
+# --- CACHING ---
+@st.cache_data(ttl=timedelta(hours=24))
+def get_cached_results():
+    """Initialize or return the cache dictionary."""
+    return {}
+
+def cache_key(url: str) -> str:
+    """Generate a cache key for a URL."""
+    return hashlib.md5(url.encode()).hexdigest()
+
 # --- URL CHECKING ---
-def check_redirects(url: str) -> dict:
-    try:
-        response = requests.get(url, allow_redirects=True, timeout=10)
-        history_urls = [resp.url for resp in response.history]
-        final_url = response.url
+async def check_redirects_async(client: httpx.AsyncClient, url: str, semaphore: asyncio.Semaphore) -> tuple:
+    """Check a single URL with concurrency control. Returns (url, result_dict)."""
+    async with semaphore:
+        # Optional: add tiny jitter for politeness (0-100ms)
+        await asyncio.sleep(0.0001 * (hash(url) % 1000))
+        
+        try:
+            response = await client.get(url, follow_redirects=True, timeout=10.0)
+            
+            # Build redirect chain
+            history_urls = [str(r.url) for r in response.history]
+            final_url = str(response.url)
 
-        if history_urls:
-            full_chain = [url] + history_urls
-            if final_url != history_urls[-1]:
-                full_chain.append(final_url)
+            if history_urls:
+                full_chain = [url] + history_urls
+                if final_url != history_urls[-1]:
+                    full_chain.append(final_url)
+            else:
+                full_chain = [url, final_url]
+
+            original_netloc = urlparse(url).netloc
+            final_netloc = urlparse(final_url).netloc
+            homepage_redirect = (original_netloc == final_netloc and url != final_url)
+
+            result = {
+                "Final URL": final_url,
+                "Status Code": response.status_code,
+                "Redirect Chain": " → ".join(full_chain),
+                "Soft 404 Suspected": homepage_redirect,
+                "Error Flag": homepage_redirect or (response.status_code != 200),
+            }
+        except Exception as e:
+            result = {
+                "Final URL": "Error",
+                "Status Code": "Error",
+                "Redirect Chain": str(e),
+                "Soft 404 Suspected": False,
+                "Error Flag": True,
+            }
+        
+        return url, result
+
+async def check_urls_concurrent(unique_urls: list, max_concurrent: int = 20) -> dict:
+    """Check multiple URLs concurrently with a limit. Returns dict mapping url -> result."""
+    semaphore = asyncio.Semaphore(max_concurrent)
+    
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        tasks = [check_redirects_async(client, url, semaphore) for url in unique_urls]
+        results = await asyncio.gather(*tasks)
+    
+    # Convert list of tuples to dict
+    return dict(results)
+
+def check_urls_with_cache(unique_urls: list, progress_callback=None) -> dict:
+    """
+    Check unique URLs, using cache when available.
+    Returns dict mapping url -> result.
+    """
+    cache = get_cached_results()
+    
+    # Separate cached and uncached URLs
+    cached_results = {}
+    urls_to_check = []
+    
+    for url in unique_urls:
+        key = cache_key(url)
+        if key in cache:
+            cached_results[url] = cache[key]
         else:
-            full_chain = [url, final_url]
-
-        original_netloc = urlparse(url).netloc
-        final_netloc = urlparse(final_url).netloc
-        homepage_redirect = (original_netloc == final_netloc and url != final_url)
-
-        return {
-            "Final URL": final_url,
-            "Status Code": response.status_code,
-            "Redirect Chain": " → ".join(full_chain),
-            "Soft 404 Suspected": homepage_redirect,
-            "Error Flag": homepage_redirect or (response.status_code != 200),
-        }
-    except Exception as e:
-        return {
-            "Final URL": "Error",
-            "Status Code": "Error",
-            "Redirect Chain": str(e),
-            "Soft 404 Suspected": False,
-            "Error Flag": True,
-        }
+            urls_to_check.append(url)
+    
+    st.write(f"📊 Found {len(cached_results)} cached results, checking {len(urls_to_check)} new URLs...")
+    
+    # Check uncached URLs
+    if urls_to_check:
+        new_results = asyncio.run(check_urls_concurrent(urls_to_check, max_concurrent=20))
+        
+        # Update cache
+        for url, result in new_results.items():
+            cache[cache_key(url)] = result
+    else:
+        new_results = {}
+    
+    # Combine results
+    all_results = {**cached_results, **new_results}
+    return all_results
 
 # --- RUN CHECK BUTTON ---
 if uploaded_file and st.button("Run URL Check"):
@@ -138,20 +205,31 @@ if uploaded_file and st.session_state.run_check:
         st.stop()
 
     results = []
-    st.write(f"✅ Checking {len(urls_long_df)} URL occurrence(s) across all columns...")
+    # Get unique URLs to check
+    unique_urls = urls_long_df["URL"].unique().tolist()
+    
+    st.write(f"✅ Found {len(urls_long_df)} URL occurrence(s), checking {len(unique_urls)} unique URL(s)...")
     progress_bar = st.progress(0)
 
+    # Check unique URLs with caching and concurrency
+    url_results = check_urls_with_cache(unique_urls)
+    
+    progress_bar.progress(1.0)
+
+    # Merge results back onto the long dataframe
+    results = []
     for i, row in urls_long_df.reset_index(drop=True).iterrows():
         url = row["URL"]
-        result = check_redirects(url)
+        result = url_results.get(url, {
+            "Final URL": "Error",
+            "Status Code": "Error",
+            "Redirect Chain": "URL not checked",
+            "Soft 404 Suspected": False,
+            "Error Flag": True,
+        })
         # merge original row (all columns) + results; also include Original URL for clarity
         merged = {**row.to_dict(), "Original URL": url, **result}
-        results.append(merged)
-
-        if delay_toggle:
-            time.sleep(1)
-        progress_bar.progress((i + 1) / len(urls_long_df))
-
+        results.append(merged
     results_df = pd.DataFrame(results)
 
     # Reorder columns: original columns first, then metadata/results
