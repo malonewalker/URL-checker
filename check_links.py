@@ -241,6 +241,7 @@ if uploaded_file and st.session_state.run_check:
                                     if c in results_df.columns]
     results_df = results_df[ordered_cols]
     st.session_state.results_df = results_df
+    st.session_state.run_check = False  # Reset to prevent re-running
     st.success("🎉 URL checking complete.")
 
 # --- RESULTS DISPLAY ---
