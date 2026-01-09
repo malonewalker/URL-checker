@@ -229,7 +229,8 @@ if uploaded_file and st.session_state.run_check:
         })
         # merge original row (all columns) + results; also include Original URL for clarity
         merged = {**row.to_dict(), "Original URL": url, **result}
-        results.append(merged
+        results.append(merged)
+
     results_df = pd.DataFrame(results)
 
     # Reorder columns: original columns first, then metadata/results
