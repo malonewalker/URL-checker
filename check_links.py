@@ -237,52 +237,67 @@ if uploaded_file and st.button("Run URL Check"):
 
 # --- MAIN LOGIC ---
 if uploaded_file and st.session_state.run_check:
-    source_df = dataframe_from_file(uploaded_file)
-    urls_long_df = build_long_url_df(source_df)
+    try:
+        st.write("📂 Processing file...")
+        source_df = dataframe_from_file(uploaded_file)
+        st.write(f"✅ Loaded {len(source_df)} rows from file")
+        
+        urls_long_df = build_long_url_df(source_df)
+        st.write(f"✅ Extracted URLs from file")
 
-    if urls_long_df.empty:
-        st.info("No URLs were detected in the uploaded file.")
-        st.stop()
+        if urls_long_df.empty:
+            st.info("No URLs were detected in the uploaded file.")
+            st.session_state.run_check = False
+            st.stop()
 
-    results = []
-    # Get unique URLs to check
-    unique_urls = urls_long_df["URL"].unique().tolist()
+        results = []
+        # Get unique URLs to check
+        unique_urls = urls_long_df["URL"].unique().tolist()
+        
+        st.write(f"✅ Found {len(urls_long_df)} URL occurrence(s), checking {len(unique_urls)} unique URL(s)...")
+        progress_bar = st.progress(0)
+
+        # Check unique URLs with caching and concurrency
+        st.write("🔍 Starting URL checks...")
+        url_results = check_urls_with_cache(unique_urls)
+        st.write(f"✅ Completed checking {len(url_results)} URLs")
     
-    st.write(f"✅ Found {len(urls_long_df)} URL occurrence(s), checking {len(unique_urls)} unique URL(s)...")
-    progress_bar = st.progress(0)
+        progress_bar.progress(1.0)
 
-    # Check unique URLs with caching and concurrency
-    url_results = check_urls_with_cache(unique_urls)
-    
-    progress_bar.progress(1.0)
+        # Merge results back onto the long dataframe
+        st.write("📊 Merging results...")
+        results = []
+        for i, row in urls_long_df.reset_index(drop=True).iterrows():
+            url = row["URL"]
+            result = url_results.get(url, {
+                "Final URL": "Error",
+                "Status Code": "Error",
+                "Redirect Chain": "URL not checked",
+                "Soft 404 Suspected": False,
+                "Error Flag": True,
+            })
+            # merge original row (all columns) + results; also include Original URL for clarity
+            merged = {**row.to_dict(), "Original URL": url, **result}
+            results.append(merged)
 
-    # Merge results back onto the long dataframe
-    results = []
-    for i, row in urls_long_df.reset_index(drop=True).iterrows():
-        url = row["URL"]
-        result = url_results.get(url, {
-            "Final URL": "Error",
-            "Status Code": "Error",
-            "Redirect Chain": "URL not checked",
-            "Soft 404 Suspected": False,
-            "Error Flag": True,
-        })
-        # merge original row (all columns) + results; also include Original URL for clarity
-        merged = {**row.to_dict(), "Original URL": url, **result}
-        results.append(merged)
+        results_df = pd.DataFrame(results)
 
-    results_df = pd.DataFrame(results)
-
-    # Reorder columns: original columns first, then metadata/results
-    original_cols = [c for c in source_df.columns if c in results_df.columns]
-    ordered_cols = original_cols + [c for c in ["Source Column", "URL", "Original URL", "Final URL",
-                                                "Status Code", "Redirect Chain",
-                                                "Soft 404 Suspected", "Error Flag"]
-                                    if c in results_df.columns]
-    results_df = results_df[ordered_cols]
-    st.session_state.results_df = results_df
-    st.session_state.run_check = False  # Reset to prevent re-running
-    st.success("🎉 URL checking complete.")
+        # Reorder columns: original columns first, then metadata/results
+        original_cols = [c for c in source_df.columns if c in results_df.columns]
+        ordered_cols = original_cols + [c for c in ["Source Column", "URL", "Original URL", "Final URL",
+                                                    "Status Code", "Redirect Chain",
+                                                    "Soft 404 Suspected", "Error Flag"]
+                                        if c in results_df.columns]
+        results_df = results_df[ordered_cols]
+        st.session_state.results_df = results_df
+        st.session_state.run_check = False  # Reset to prevent re-running
+        st.success("🎉 URL checking complete!")
+        st.rerun()  # Force rerun to display results
+        
+    except Exception as e:
+        st.error(f"❌ Error occurred: {str(e)}")
+        st.exception(e)
+        st.session_state.run_check = False
 
 # --- RESULTS DISPLAY ---
 if "results_df" in st.session_state:
