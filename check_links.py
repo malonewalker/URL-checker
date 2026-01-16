@@ -131,6 +131,19 @@ async def check_redirects_async(client: httpx.AsyncClient, url: str, semaphore: 
                 original_parsed = urlparse(url)
                 final_parsed = urlparse(final_url)
                 
+                # Check for error patterns in the final URL (both full URL and path)
+                final_url_lower = final_url.lower()
+                final_path_lower = final_parsed.path.lower()
+                error_patterns = ['/404', '/error', '/not-found', '/notfound', '/page-not-found', 
+                                 '/missing', '/unavailable', '/oops', '/invalid', 
+                                 '404', 'error', 'not-found', 'notfound']
+                
+                # Check both the full URL and the path specifically
+                has_error_pattern = any(pattern in final_url_lower for pattern in error_patterns) or \
+                                   any(pattern in final_path_lower for pattern in error_patterns) or \
+                                   final_path_lower.endswith('/error') or \
+                                   final_path_lower.endswith('/404')
+                
                 # Only flag as soft 404 if:
                 # 1. Same domain AND
                 # 2. Path changed significantly (not just protocol/www/trailing slash)
@@ -149,8 +162,8 @@ async def check_redirects_async(client: httpx.AsyncClient, url: str, semaphore: 
                     "Final URL": final_url,
                     "Status Code": response.status_code,
                     "Redirect Chain": " → ".join(full_chain),
-                    "Soft 404 Suspected": homepage_redirect,
-                    "Error Flag": homepage_redirect or (response.status_code not in [200, 201, 202, 203, 204]),
+                    "Soft 404 Suspected": homepage_redirect or has_error_pattern,
+                    "Error Flag": homepage_redirect or has_error_pattern or (response.status_code not in [200, 201, 202, 203, 204]),
                 }
                 return url, result  # Success, return immediately
                 
