@@ -107,50 +107,90 @@ def cache_key(url: str) -> str:
 async def check_redirects_async(client: httpx.AsyncClient, url: str, semaphore: asyncio.Semaphore) -> tuple:
     """Check a single URL with concurrency control. Returns (url, result_dict)."""
     async with semaphore:
-        # Optional: add tiny jitter for politeness (0-100ms)
-        await asyncio.sleep(0.0001 * (hash(url) % 1000))
+        # Add small delay for politeness (50-200ms jitter)
+        await asyncio.sleep(0.05 + (0.00015 * (hash(url) % 1000)))
         
-        try:
-            response = await client.get(url, follow_redirects=True, timeout=10.0)
-            
-            # Build redirect chain
-            history_urls = [str(r.url) for r in response.history]
-            final_url = str(response.url)
+        # Retry logic for transient failures
+        max_retries = 2
+        for attempt in range(max_retries + 1):
+            try:
+                response = await client.get(url, follow_redirects=True, timeout=20.0)
+                
+                # Build redirect chain
+                history_urls = [str(r.url) for r in response.history]
+                final_url = str(response.url)
 
-            if history_urls:
-                full_chain = [url] + history_urls
-                if final_url != history_urls[-1]:
-                    full_chain.append(final_url)
-            else:
-                full_chain = [url, final_url]
+                if history_urls:
+                    full_chain = [url] + history_urls
+                    if final_url != history_urls[-1]:
+                        full_chain.append(final_url)
+                else:
+                    full_chain = [url, final_url]
 
-            original_netloc = urlparse(url).netloc
-            final_netloc = urlparse(final_url).netloc
-            homepage_redirect = (original_netloc == final_netloc and url != final_url)
+                # Detect soft 404s (redirects to homepage/generic pages)
+                original_parsed = urlparse(url)
+                final_parsed = urlparse(final_url)
+                
+                # Only flag as soft 404 if:
+                # 1. Same domain AND
+                # 2. Path changed significantly (not just protocol/www/trailing slash)
+                # 3. Final path is suspiciously short (likely homepage or error page)
+                same_domain = original_parsed.netloc.replace('www.', '') == final_parsed.netloc.replace('www.', '')
+                original_path = original_parsed.path.rstrip('/')
+                final_path = final_parsed.path.rstrip('/')
+                
+                # Soft 404 if path changed AND final path is just "/" or very short
+                path_changed_significantly = (original_path != final_path and 
+                                             original_path != '' and 
+                                             len(final_path) <= 1)
+                homepage_redirect = same_domain and path_changed_significantly
 
-            result = {
-                "Final URL": final_url,
-                "Status Code": response.status_code,
-                "Redirect Chain": " → ".join(full_chain),
-                "Soft 404 Suspected": homepage_redirect,
-                "Error Flag": homepage_redirect or (response.status_code != 200),
-            }
-        except Exception as e:
-            result = {
-                "Final URL": "Error",
-                "Status Code": "Error",
-                "Redirect Chain": str(e),
-                "Soft 404 Suspected": False,
-                "Error Flag": True,
-            }
+                result = {
+                    "Final URL": final_url,
+                    "Status Code": response.status_code,
+                    "Redirect Chain": " → ".join(full_chain),
+                    "Soft 404 Suspected": homepage_redirect,
+                    "Error Flag": homepage_redirect or (response.status_code not in [200, 201, 202, 203, 204]),
+                }
+                return url, result  # Success, return immediately
+                
+            except (httpx.TimeoutException, httpx.ConnectTimeout, httpx.ReadTimeout) as e:
+                # Retry on timeout errors
+                if attempt < max_retries:
+                    await asyncio.sleep(1.0 * (attempt + 1))  # Exponential backoff
+                    continue
+                else:
+                    result = {
+                        "Final URL": "Timeout",
+                        "Status Code": "Timeout",
+                        "Redirect Chain": f"Request timed out after {max_retries + 1} attempts",
+                        "Soft 404 Suspected": False,
+                        "Error Flag": True,
+                    }
+            except Exception as e:
+                # Other errors - don't retry
+                result = {
+                    "Final URL": "Error",
+                    "Status Code": "Error",
+                    "Redirect Chain": str(e),
+                    "Soft 404 Suspected": False,
+                    "Error Flag": True,
+                }
+                break
         
         return url, result
 
-async def check_urls_concurrent(unique_urls: list, max_concurrent: int = 20) -> dict:
+async def check_urls_concurrent(unique_urls: list, max_concurrent: int = 10) -> dict:
     """Check multiple URLs concurrently with a limit. Returns dict mapping url -> result."""
     semaphore = asyncio.Semaphore(max_concurrent)
     
-    async with httpx.AsyncClient(timeout=10.0) as client:
+    # Configure client with better settings for reliability
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+    limits = httpx.Limits(max_keepalive_connections=max_concurrent, max_connections=max_concurrent * 2)
+    
+    async with httpx.AsyncClient(timeout=20.0, headers=headers, limits=limits, follow_redirects=True) as client:
         tasks = [check_redirects_async(client, url, semaphore) for url in unique_urls]
         results = await asyncio.gather(*tasks)
     
@@ -179,7 +219,7 @@ def check_urls_with_cache(unique_urls: list, progress_callback=None) -> dict:
     
     # Check uncached URLs
     if urls_to_check:
-        new_results = asyncio.run(check_urls_concurrent(urls_to_check, max_concurrent=20))
+        new_results = asyncio.run(check_urls_concurrent(urls_to_check, max_concurrent=10))
         
         # Update cache
         for url, result in new_results.items():
